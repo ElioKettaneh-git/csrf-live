@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>CSRF Live — Elio Kettaneh</title>
+<style>
+*{box-sizing:border-box}body{margin:24px;background:#0d1421;color:#e5edf8;font:15px system-ui}h1{margin-bottom:5px}p{color:#aebdd1}.tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:20px 0}button,select{background:#21334c;color:white;border:1px solid #536882;border-radius:6px;padding:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}textarea{width:100%;height:340px;background:#111e30;color:#d9edff;border:1px solid #536882;border-radius:8px;padding:14px;font:13px monospace}#status{white-space:pre-wrap;padding:12px;border-left:4px solid #74b8ff;min-height:60px}iframe{width:100%;height:240px;background:white;border:1px solid #536882;border-radius:8px}label{cursor:pointer}@media(max-width:750px){.grid{grid-template-columns:1fr}}
+</style>
+<h1>CSRF Live</h1><p>Elio Kettaneh · HTTP / cURL → HTML PoC</p>
+<div class="tools"><label>Scheme <select id="scheme"><option>https</option><option>http</option></select></label><label>Technique <select id="mode"><option>Auto</option><option>Form</option><option>Fetch</option></select></label><label><input id="auto" type="checkbox" checked> Automatically execute after editing</label><button id="example">Load example</button><button id="copy">Copy HTML</button><button id="save">Save HTML</button></div>
+<p>Auto execution is enabled: pasting a valid request sends it after a 1-second pause. Use your authorized test target.</p>
+<div class="grid"><section><h3>Request</h3><textarea id="request" spellcheck="false" placeholder="Paste a raw HTTP request or a POSIX cURL command here"></textarea></section><section><h3>Result — generated HTML</h3><textarea id="result" readonly spellcheck="false"></textarea></section></div>
+<div id="status">Ready. Paste your request. Conversion stays in your browser.</div>
+<p>All conversion happens in your browser. Requests are not uploaded or stored by this tool. An HTTPS page may block HTTP targets.</p><h3>Automatic execution preview</h3><p>A blank or blocked preview does not confirm success or failure. Check the target’s state or browser Network panel.</p><iframe id="preview" sandbox="allow-scripts allow-forms" title="PoC execution"></iframe>
+<script>
+const $ = id => document.getElementById(id);
+let timer, revision = 0, lastRun = '';
+const esc = s => String(s).replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const json = value => JSON.stringify(value).replaceAll('<','\\u003c').replaceAll('>','\\u003e').replaceAll('&','\\u0026');
+function shellTokens(text) {
+  const tokens=[]; let token='', quote=null, started=false;
+  text=text.replace(/\\\r?\n/g,'');
+  for(let i=0;i<text.length;i++) {
+    const c=text[i];
+    if(quote==="'") {if(c==="'")quote=null;else token+=c;started=true;continue}
+    if(quote==='"') {
+      if(c==='"')quote=null;
+      else if(c==='\\' && i+1<text.length && /["\\$`]/.test(text[i+1]))token+=text[++i];
+      else token+=c;
+      started=true;continue;
+    }
+    if(c==='"'||c==="'"){quote=c;started=true}
+    else if(c==='\\'){if(++i===text.length)throw Error('Incomplete cURL escape.');token+=text[i];started=true}
+    else if(/\s/.test(c)){if(started){tokens.push(token);token='';started=false}}
+    else {token+=c;started=true}
+  }
+  if(quote)throw Error('Close the quote in your cURL command.');
+  if(started)tokens.push(token);
+  return tokens;
+}
+function parseRequest(raw, scheme) {
+  raw=raw.replace(/^\s+/,'');
+  if(!raw.trim())throw Error('Paste a raw HTTP request or a POSIX cURL command.');
+  let method,url,body='',headers={};
+  if(/^curl\s/.test(raw)) {
+    const tokens=shellTokens(raw), chunks=[];
+    const valued=['-H','--header','-X','--request','-d','--data','--data-raw','--data-binary','--data-urlencode','--url','-b','--cookie','-A','--user-agent','-e','--referer'];
+    for(let i=1;i<tokens.length;i++) {
+      let t=tokens[i], attached;
+      if(t.startsWith('--')&&t.includes('=')){const at=t.indexOf('=');attached=t.slice(at+1);t=t.slice(0,at)}
+      if(valued.includes(t)) {
+        const v=attached===undefined?tokens[++i]:attached;
+        if(v===undefined)throw Error('Missing value after '+t);
+        if(t==='-H'||t==='--header'){const at=v.indexOf(':');if(at<1)throw Error('Invalid header.');headers[v.slice(0,at).trim().toLowerCase()]=v.slice(at+1).trim()}
+        else if(t==='-X'||t==='--request')method=v.toUpperCase();
+        else if(t==='--url')url=v;
+        else if(t==='-d'||t.startsWith('--data')) {
+          if(v.startsWith('@')&&t!=='--data-raw')throw Error('File-based cURL bodies are unsupported. Paste the body directly.');
+          if(t==='--data-urlencode') {const at=v.indexOf('=');chunks.push(at<0?encodeURIComponent(v):v.slice(0,at)+'='+encodeURIComponent(v.slice(at+1)))}
+          else chunks.push(v);
+        }
+      } else if(['--compressed','--insecure','-k','--silent','-s','--location','-L'].includes(t)) {}
+      else if(t.startsWith('-'))throw Error('Unsupported cURL option: '+t+'. Paste a raw Burp request instead.');
+      else {if(url)throw Error('Use one URL per request.');url=t}
+    }
+    body=chunks.join('&');method=method||(chunks.length?'POST':'GET');
+    if(chunks.length&&!headers['content-type'])headers['content-type']='application/x-www-form-urlencoded';
+  } else {
+    const text=raw.replaceAll('\r\n','\n'), split=text.indexOf('\n\n');
+    const head=split<0?text:text.slice(0,split);body=split<0?'':text.slice(split+2);
+    const lines=head.split('\n');const match=lines.shift().trim().match(/^([A-Za-z]+)\s+(\S+)(?:\s+HTTP\/\d(?:\.\d)?)?$/);
+    if(!match)throw Error('Expected: POST /path HTTP/1.1, then headers, then a blank line and the body.');
+    method=match[1].toUpperCase();url=match[2];
+    for(const line of lines){if(!line.trim())continue;const at=line.indexOf(':');if(at<1)throw Error('Invalid header. Add a blank line before the body.');headers[line.slice(0,at).trim().toLowerCase()]=line.slice(at+1).trim()}
+  }
+  if(!url)throw Error('Request URL is missing.');
+  if(url.startsWith('/')) {
+    const host=headers.host;
+    if(!host||/[\s/?#@\\]/.test(host))throw Error('A relative request URL needs a valid Host header.');
+    url=scheme+'://'+host+url;
+  }
+  if(!/^https?:\/\//i.test(url)||/[\x00-\x20]/.test(url))throw Error('Use an HTTP or HTTPS URL.');
+  const parsed=new URL(url);
+  if(parsed.username||parsed.password||parsed.hash)throw Error('Remove URL credentials and fragments.');
+  if(!['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS'].includes(method))throw Error('Unsupported method: '+method);
+  return {method,url:parsed.href,headers,body};
+}
+function generate(raw,scheme='https',mode='Auto') {
+  const r=parseRequest(raw,scheme);let ct=(r.headers['content-type']||'').split(';')[0].trim().toLowerCase();
+  const notes=['Cookies and custom authentication headers are not copied. Browser cookie policies and server protections still apply.'];
+  if(!ct&&r.body){if(/^[\s]*[\[{]/.test(r.body))ct='application/json';else if(r.body.includes('='))ct='application/x-www-form-urlencoded';if(ct)notes.push('Inferred Content-Type: '+ct+'.')}
+  const formOK=(r.method==='GET'&&!r.body)||(r.method==='POST'&&(ct==='application/x-www-form-urlencoded'||!r.body));
+  if(mode==='Form'&&!formOK)throw Error('This request needs Auto or Fetch. Forms here support GET and URL-encoded POST.');
+  let code;
+  if(mode==='Form'||mode==='Auto'&&formOK) {
+    const target=new URL(r.url), pairs=new URLSearchParams(r.method==='GET'?target.search:r.body);
+    if(r.method==='GET')target.search='';
+    const fields=Array.from(pairs,([k,v])=>'<input type="hidden" name="'+esc(k)+'" value="'+esc(v)+'">').join('\n');
+    code='<form id="poc" action="'+esc(target.href)+'" method="'+r.method.toLowerCase()+'" accept-charset="UTF-8">\n'+fields+'\n</form>\n<script>\nHTMLFormElement.prototype.submit.call(document.getElementById("poc"));\n<\/script>';
+    notes.unshift('Form PoC: submits once when opened.');
+  } else {
+    if(['GET','HEAD'].includes(r.method)&&r.body)throw Error('Fetch cannot send a GET or HEAD body.');
+    if(ct.startsWith('multipart/'))throw Error('Multipart uploads need a request-specific FormData implementation.');
+    const options={method:r.method,credentials:'include'};
+    if(ct)options.headers={'Content-Type':r.headers['content-type']||ct};
+    if(!['GET','HEAD'].includes(r.method))options.body=r.body;
+    code='<pre id="status">Sending authorized test request…</pre>\n<script>\n(async()=>{try{const response=await fetch('+json(r.url)+','+json(options)+');document.getElementById("status").textContent="HTTP "+response.status+"\\n"+await response.text()}catch(e){document.getElementById("status").textContent="Browser blocked sending or reading the response. Check DevTools Network. "+e}})();\n<\/script>';
+    notes.unshift('Fetch PoC: executes once when opened. CORS/preflight can block sending or reading the response.');
+  }
+  return {html:'<!doctype html>\n<html lang="en">\n<meta charset="utf-8">\n<title>CSRF PoC | Elio Kettaneh</title>\n<body>\n'+code+'\n</body>\n</html>\n',note:notes.join(' ')};
+}
+function schedule(){clearTimeout(timer);const version=++revision;timer=setTimeout(()=>update(version),1000)}
+function update(version){if(version!==revision)return;try{const data=generate($('request').value,$('scheme').value,$('mode').value);$('result').value=data.html;$('status').textContent=data.note;if($('auto').checked&&lastRun!==data.html){lastRun=data.html;$('preview').srcdoc=data.html;$('status').textContent+=' Execution triggered. Verify the result on your test target.'}}catch(e){$('result').value='';$('status').textContent=e.message}}
+if(typeof document!=='undefined') {
+  $('request').addEventListener('input',schedule);
+  for(const id of ['scheme','mode'])$(id).addEventListener('change',schedule);
+  $('auto').addEventListener('change',()=>{lastRun='';if($('auto').checked)schedule();else $('preview').srcdoc=''});
+  $('example').onclick=()=>{
+    $('request').value='POST /profile HTTP/1.1\nHost: example.test\nContent-Type: application/x-www-form-urlencoded\n\nname=Elio&language=en';
+    $('auto').checked=false;$('preview').srcdoc='';schedule();
+  };
+  $('copy').onclick=async()=>{if(!$('result').value)return;try{await navigator.clipboard.writeText($('result').value)}catch(e){$('result').select();document.execCommand('copy')}};
+  $('save').onclick=()=>{if(!$('result').value)return;const url=URL.createObjectURL(new Blob([$('result').value],{type:'text/html'}));const a=document.createElement('a');a.href=url;a.download='csrf_poc.html';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+}
+if(typeof module!=='undefined')module.exports={generate,parseRequest,shellTokens};
+
+</script></html>
